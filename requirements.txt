@@ -1,0 +1,4 @@
+together>=1.5.8
+python-dotenv
+uagents-core
+mcp
