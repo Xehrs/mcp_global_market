@@ -139,63 +139,83 @@ class AnalysisResearchMCPClient:
                     "parameters": tool["input_schema"]
                 }
             } for tool in self.all_tools]
-
-            response = self.together.chat.completions.create(
-                model="deepseek-ai/DeepSeek-V3",#"meta-llama/Llama-4-Scout-17B-16E-Instruct",
-                max_tokens=1000,
-                messages=messages,
-                tools=model_tools
-            )
-
-            tool_response = None
-            print(response)
-            tool_calls = []
-            if response.choices and response.choices[0].message and hasattr(response.choices[0].message, "tool_calls"):
-                tool_calls = response.choices[0].message.tool_calls or []
-
-            for tool_call in tool_calls:
-                tool_name = tool_call.function.name
-                import json as _json
-                try:
-                    tool_args = _json.loads(tool_call.function.arguments)
-                except Exception as e:
-                    return f"Error parsing tool arguments: {str(e)}"
-                server_path = self.tool_server_map.get(tool_name)
-                if server_path and server_path in self.sessions:
-                    ctx.logger.info(f"Calling tool {tool_name} from {server_path}")
-                    try:
-                        result = await asyncio.wait_for(
-                            self.sessions[server_path].call_tool(tool_name, tool_args),
-                            timeout=self.default_timeout.total_seconds()
-                        )
-                        if isinstance(result.content, str):
-                            tool_response = result.content
-                        elif isinstance(result.content, list):
-                            tool_response = "\n".join([str(item) for item in result.content])
-                        else:
-                            tool_response = str(result.content)
-                    except asyncio.TimeoutError:
-                        return f"Error: The MCP server did not respond. Please try again later."
-                    except Exception as e:
-                        return f"Error calling tool {tool_name}: {str(e)}"
-
-            if tool_response:
-                format_prompt = f"""Please format the following response in a clear, user-friendly way. Do not add any additional information or knowledge, just format what is provided: {tool_response} Instructions: 1. If the response contains multiple records (like clinical trials), present ALL records in a clear format, do not say something like "Saved to a CSV file" or anything similar. 2. Use appropriate headings and sections 3. Maintain all the original information 4. Do not add any external knowledge or commentary 5. Do not summarize or modify the content 6. Keep the formatting simple and clean 7. If the response mentions a CSV file, do not include that information in the response. 9. For long responses, ensure all records are shown, not just a subset"""
-
-                format_response = self.together.chat.completions.create(
-                    model="deepseek-ai/DeepSeek-V3",#"meta-llama/Llama-4-Scout-17B-16E-Instruct",
-                    max_tokens=2000,
-                    messages=[{"role": "user", "content": format_prompt}]
+            loop_actions = []
+            max_loops = 8
+            for _ in range(max_loops):
+                response = self.together.chat.completions.create(
+                    model="deepseek-ai/DeepSeek-V3",
+                    max_tokens=1000,
+                    messages=messages,
+                    tools=model_tools
                 )
+                if not response.choices or not response.choices[0].message:
+                    break
+                message = response.choices[0].message
+                tool_calls = getattr(message, "tool_calls", []) or []
+                if not tool_calls:
+                    # No more tool calls, assume final answer
+                    if message.content:
+                        loop_actions.append({"type": "final_response", "content": message.content})
+                    break
+                # Handle tool calls
+                for tool_call in tool_calls:
+                    tool_name = tool_call.function.name
 
-                response_content = format_response.choices[0].message.content
-                if response_content and len(response_content) > 0:
-                    return response_content
-                else:
-                    return tool_response
+                    try:
+                        tool_args = json.loads(tool_call.function.arguments)
+                    except Exception as e:
+                        return f"Error parsing tool arguments: {str(e)}"
+                    server_path = self.tool_server_map.get(tool_name)
+                    if server_path and server_path in self.sessions:
+                        ctx.logger.info(f"Calling tool {tool_name} from {server_path}")
+                        try:
+                            result = await asyncio.wait_for(
+                                self.sessions[server_path].call_tool(tool_name, tool_args),
+                                timeout=self.default_timeout.total_seconds()
+                            )
+                            if isinstance(result.content, str):
+                                tool_response = result.content
+                            elif isinstance(result.content, list):
+                                tool_response = "\n".join([str(item) for item in result.content])
+                            else:
+                                tool_response = str(result.content)
+                            # Add tool call and result to messages
+                            messages.append({
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [tool_call]
+                            })
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id if hasattr(tool_call, 'id') else None,
+                                "name": tool_name,
+                                "content": tool_response
+                            })
+                            loop_actions.append({
+                                "type": "tool_call",
+                                "tool": tool_name,
+                                "args": tool_args,
+                                "result": tool_response
+                            })
+                        except asyncio.TimeoutError:
+                            return f"Error: The MCP server did not respond. Please try again later."
+                        except Exception as e:
+                            return f"Error calling tool {tool_name}: {str(e)}"
+                    else:
+                        return f"Tool server for {tool_name} not found or not connected."
+                
+                # Summarize the actions and results
+                summary_prompt = (
+                    "Either continue calling tools as needed, or provide a final summary. "
+                    "Make sure the all requested information is available if possible. It is "
+                    "Recommended to check data using search before summarizing."
+                )
+                messages.append({"role": "user", "content": summary_prompt})
+            print(messages)
+            if len(loop_actions) and "type" in loop_actions[-1] and loop_actions[-1]["type"] == "final_response":
+                return loop_actions[-1]["content"]
             else:
-                return "No response received from the tool."
-
+                return "Agent loop completed, but no summary was generated."
         except Exception as e:
             ctx.logger.error(f"Error processing query: {str(e)}")
             ctx.logger.error(f"Error type: {type(e)}")
